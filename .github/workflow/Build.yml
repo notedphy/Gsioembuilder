@@ -1,0 +1,59 @@
+name: OEM GSI Builder - Build, Upload & Notify
+
+on:
+  workflow_dispatch:  # Trigger manual via Actions tab. Bisa tambah 'push: branches: [main]' untuk otomatis.
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget unzip zip curl sftp  # Dependencies dasar untuk ErfanGSIs
+
+      - name: Clone ErfanGSIs Tool
+        uses: actions/checkout@v4
+        with:
+          repository: erfanoabap/ErfanGSIs
+          ref: master  # Atau branch terbaru
+          path: ErfanGSIs
+
+      - name: Build GSI
+        run: |
+          cd ErfanGSIs
+          # Load config dari root repo
+          source ../config.env
+          # Jalankan build script (sesuaikan jika perlu)
+          bash url2GSI.sh "${URL}" "${FIRMWARE_TYPE}" "${OUTPUT_TYPE}" ${EXTRA_ARGS}
+          # Output GSI biasanya di folder system_squash.img atau *.zip
+          ls -la  # Debug: Lihat output files
+
+      - name: Upload to SourceForge via SFTP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: frs.sourceforge.net
+          username: ${{ secrets.SF_USERNAME }}
+          password: ${{ secrets.SF_PASSWORD }}
+          port: 22
+          source: "*.zip,*.img"  # Upload file GSI hasil build (sesuaikan pattern)
+          target: "/home/frs/project/${{ secrets.SF_PROJECT }}/${{ env.SOURCEFORGE_DIR || 'GSI-builds' }}/"
+          strip_components: 0  # Jangan strip path
+
+      - name: Send Telegram Notification
+        if: always()  # Jalankan meski gagal (untuk notif error)
+        uses: appleboy/telegram-action@v0.1.0
+        with:
+          to: ${{ secrets.TG_CHAT_ID }}
+          token: ${{ secrets.TG_BOT_TOKEN }}
+          format: html  # Opsional untuk formatting
+          message: |
+            <b>OEM GSI Build Completed!</b>
+            <i>Status:</i> ${{ job.status }}
+            <i>Repo:</i> ${{ github.repository }}
+            <i>Files uploaded to:</i> ${{ env.SOURCEFORGE_URL || 'https://sourceforge.net/projects/yourproject/files/GSI-builds/' }}
+            <i>Run ID:</i> ${{ github.run_id }}
+            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Logs</a>
