@@ -1,59 +1,84 @@
-name: OEM GSI Builder - Build, Upload & Notify
+name: OEM GSI Builder - Build, Upload SF & Notify TG
 
 on:
-  workflow_dispatch:  # Trigger manual via Actions tab. Bisa tambah 'push: branches: [main]' untuk otomatis.
+  workflow_dispatch:  # Manual trigger
+  # push:  # Uncomment untuk auto on push
+  #   branches: [ main ]
 
 jobs:
-  build-and-upload:
+  build-gsi:
     runs-on: ubuntu-latest
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
-      - name: Checkout Repository
+      - name: Checkout Repo
         uses: actions/checkout@v4
 
       - name: Install Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git wget unzip zip curl sftp  # Dependencies dasar untuk ErfanGSIs
+          sudo apt-get update -y
+          sudo apt-get install -y git wget unzip zip curl lftp openssh-client python3 python3-pip
+          lftp --version  # Debug: Pastikan lftp terinstall
+          pip3 install --user requests  # Jika ErfanGSIs butuh
 
       - name: Clone ErfanGSIs Tool
-        uses: actions/checkout@v4
-        with:
-          repository: erfanoabap/ErfanGSIs
-          ref: master  # Atau branch terbaru
-          path: ErfanGSIs
+        run: |
+          git clone https://github.com/erfanoabap/ErfanGSIs.git
+          cd ErfanGSIs
+          git checkout master  # Atau branch stabil
 
-      - name: Build GSI
+      - name: Load Config & Build GSI
+        env:
+          URL: ${{ vars.URL || '' }}  # Bisa override via vars jika mau
+        run: |
+          if [ -f ../config.env ]; then
+            source ../config.env
+          fi
+          cd ErfanGSIs
+          chmod +x url2GSI.sh
+          bash url2GSI.sh "${URL}" "${FIRMWARE_TYPE}" "${OUTPUT_TYPE}" ${EXTRA_ARGS}
+          echo "Build selesai. List output:"
+          ls -la output/  # Asumsi output di sini; sesuaikan jika beda
+          find . -name "*.zip" -o -name "*.img"  # Debug files
+
+      - name: Prepare Upload Files
+        id: files
         run: |
           cd ErfanGSIs
-          # Load config dari root repo
-          source ../config.env
-          # Jalankan build script (sesuaikan jika perlu)
-          bash url2GSI.sh "${URL}" "${FIRMWARE_TYPE}" "${OUTPUT_TYPE}" ${EXTRA_ARGS}
-          # Output GSI biasanya di folder system_squash.img atau *.zip
-          ls -la  # Debug: Lihat output files
+          mkdir -p ../upload
+          cp output/*.zip output/*.img ../upload/ 2>/dev/null || echo "No files found"
+          echo "Files siap upload:"
+          ls -la ../upload/
 
-      - name: Upload to SourceForge via SFTP
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: frs.sourceforge.net
-          username: ${{ secrets.SF_USERNAME }}
-          password: ${{ secrets.SF_PASSWORD }}
-          port: 22
-          source: "*.zip,*.img"  # Upload file GSI hasil build (sesuaikan pattern)
-          target: "/home/frs/project/${{ secrets.SF_PROJECT }}/${{ env.SOURCEFORGE_DIR || 'GSI-builds' }}/"
-          strip_components: 0  # Jangan strip path
+      - name: Upload to SourceForge via LFTP
+        if: success() || failure()
+        env:
+          SF_USER: ${{ secrets.SF_USERNAME }}
+          SF_PASS: ${{ secrets.SF_PASSWORD }}
+          SF_PROJECT: ${{ secrets.SF_PROJECT }}
+          TARGET_DIR: ${{ env.SOURCEFORGE_DIR || 'GSI-builds' }}
+          SF_LINK: https://sourceforge.net/projects/${{ secrets.SF_PROJECT }}/files/${{ env.SOURCEFORGE_DIR || 'GSI-builds' }}/
+        run: |
+          # Buat folder jika belum ada
+          lftp -c "set sftp:auto-confirm yes; open -u $SF_USER,$SF_PASS sftp://frs.sourceforge.net; mkdir -p /home/frs/project/$SF_PROJECT/$TARGET_DIR"
+          # Upload parallel
+          cd ../upload
+          lftp -c "set sftp:auto-confirm yes; open -u $SF_USER,$SF_PASS sftp://frs.sourceforge.net; mirror -R . /home/frs/project/$SF_PROJECT/$TARGET_DIR/ --parallel=10 --include-glob '*.zip' --include-glob '*.img' --verbose"
+          echo "Upload selesai! Link: $SF_LINK"
+          echo "SF_LINK=$SF_LINK" >> $GITHUB_ENV  # Pass ke step berikutnya
 
       - name: Send Telegram Notification
-        if: always()  # Jalankan meski gagal (untuk notif error)
-        uses: appleboy/telegram-action@v0.1.0
+        if: always()
+        uses: appleboy/telegram-action@v1.0.0
         with:
           to: ${{ secrets.TG_CHAT_ID }}
           token: ${{ secrets.TG_BOT_TOKEN }}
-          format: html  # Opsional untuk formatting
+          format: html
           message: |
-            <b>OEM GSI Build Completed!</b>
-            <i>Status:</i> ${{ job.status }}
-            <i>Repo:</i> ${{ github.repository }}
-            <i>Files uploaded to:</i> ${{ env.SOURCEFORGE_URL || 'https://sourceforge.net/projects/yourproject/files/GSI-builds/' }}
-            <i>Run ID:</i> ${{ github.run_id }}
-            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Logs</a>
+            <b>OEM GSI Build: ${{ job.status == 'success' && '✅ Sukses' || '❌ Gagal' }}</b>
+            <i>Repo:</i> <code>${{ github.repository }}</code>
+            <i>Trigger:</i> ${{ github.event_name }}
+            <i>Files di SourceForge:</i> <a href="${{ env.SF_LINK }}">Buka Folder</a>
+            <i>Waktu:</i> ${{ github.event.head_commit.timestamp || 'Manual' }}
+            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">📄 Lihat Logs</a>
+            <i>Catatan:</i> Cek output untuk detail files.
