@@ -1,8 +1,8 @@
 name: OEM GSI Builder - Build, Upload SF & Notify TG
 
 on:
-  workflow_dispatch:  # Manual trigger
-  # push:  # Uncomment untuk auto on push
+  workflow_dispatch:
+  # push:
   #   branches: [ main ]
 
 jobs:
@@ -10,62 +10,86 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DEBIAN_FRONTEND: noninteractive
+      URL: ${{ vars.URL || '' }}
+      FIRMWARE_TYPE: ${{ vars.FIRMWARE_TYPE || '' }}
+      OUTPUT_TYPE: ${{ vars.OUTPUT_TYPE || 'all' }}
+      SOURCEFORGE_DIR: ${{ vars.SOURCEFORGE_DIR || 'GSI-builds' }}
+      EXTRA_ARGS: ${{ vars.EXTRA_ARGS || '' }}
+      SF_LINK: https://sourceforge.net/projects/${{ secrets.SF_PROJECT }}/files/${{ vars.SOURCEFORGE_DIR || 'GSI-builds' }}/
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
+      - name: Load Config.env (Fallback)
+        run: |
+          if [ -f config.env ]; then
+            source config.env
+            echo "Loaded from config.env"
+          fi
+          # Debug vars
+          echo "URL: $URL"
+          echo "FIRMWARE_TYPE: $FIRMWARE_TYPE"
+          echo "OUTPUT_TYPE: $OUTPUT_TYPE"
+          echo "EXTRA_ARGS: $EXTRA_ARGS"
+          if [ -z "$URL" ] || [ -z "$FIRMWARE_TYPE" ]; then
+            echo "ERROR: URL atau FIRMWARE_TYPE kosong! Set di Repository Variables."
+            exit 1
+          fi
+
       - name: Install Dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y git wget unzip zip curl lftp openssh-client python3 python3-pip
-          lftp --version  # Debug: Pastikan lftp terinstall
-          pip3 install --user requests  # Jika ErfanGSIs butuh
+          sudo apt-get install -y git wget unzip zip curl lftp openssh-client python3 python3-pip brotli android-sdk-libsparse-utils aria2 img2simg p7zip-full
+          lftp --version
 
-      - name: Clone ErfanGSIs Tool
+      - name: Clone ErfanGSIs with Submodules
         run: |
-          git clone https://github.com/erfanoabdi/ErfanGSIs.git
+          git clone --recurse-submodules https://github.com/erfanoabdi/ErfanGSIs.git
           cd ErfanGSIs
-          git checkout master  # Atau branch stabil
+          git checkout master
 
-      - name: Load Config & Build GSI
-        env:
-          URL: ${{ vars.URL || '' }}  # Bisa override via vars jika mau
+      - name: Setup ErfanGSIs
         run: |
-          if [ -f ../config.env ]; then
-            source ../config.env
-          fi
           cd ErfanGSIs
-          chmod +x url2GSI.sh
-          bash url2GSI.sh "${URL}" "${FIRMWARE_TYPE}" "${OUTPUT_TYPE}" ${EXTRA_ARGS}
-          echo "Build selesai. List output:"
-          ls -la output/  # Asumsi output di sini; sesuaikan jika beda
-          find . -name "*.zip" -o -name "*.img"  # Debug files
+          bash setup.sh || echo "Setup selesai (ignore minor error)"
+
+      - name: Build GSI
+        run: |
+          cd ErfanGSIs
+          chmod +x url2GSI.sh make.sh
+          # Map OUTPUT_TYPE ke flag
+          if [ "$OUTPUT_TYPE" = "ab" ]; then EXTRA_ARGS="--ab $EXTRA_ARGS"; fi
+          if [ "$OUTPUT_TYPE" = "aonly" ]; then EXTRA_ARGS="--aonly $EXTRA_ARGS"; fi
+          bash url2GSI.sh "$URL" "$FIRMWARE_TYPE" $EXTRA_ARGS || echo "Build gagal, lanjut debug"
+          echo "Build attempt selesai. Debug output:"
+          ls -la .
+          ls -la output/ 2>/dev/null || echo "No output/ folder"
+          find . -name "*.img" -o -name "*.zip" -o -name "*.7z" | head -20
 
       - name: Prepare Upload Files
-        id: files
         run: |
-          cd ErfanGSIs
-          mkdir -p ../upload
-          cp output/*.zip output/*.img ../upload/ 2>/dev/null || echo "No files found"
+          mkdir -p upload
+          find ErfanGSIs -name "*.img" -o -name "*.zip" -o -name "*.7z" | xargs -I {} cp {} upload/ || echo "No files to copy"
           echo "Files siap upload:"
-          ls -la ../upload/
+          ls -la upload/
 
-      - name: Upload to SourceForge via LFTP
-        if: success() || failure()
+      - name: Test SFTP Connection & Upload
+        if: always()
         env:
           SF_USER: ${{ secrets.SF_USERNAME }}
           SF_PASS: ${{ secrets.SF_PASSWORD }}
           SF_PROJECT: ${{ secrets.SF_PROJECT }}
-          TARGET_DIR: ${{ env.SOURCEFORGE_DIR || 'GSI-builds' }}
-          SF_LINK: https://sourceforge.net/projects/${{ secrets.SF_PROJECT }}/files/${{ env.SOURCEFORGE_DIR || 'GSI-builds' }}/
+          TARGET_DIR: ${{ env.SOURCEFORGE_DIR }}
         run: |
-          # Buat folder jika belum ada
-          lftp -c "set sftp:auto-confirm yes; open -u $SF_USER,$SF_PASS sftp://frs.sourceforge.net; mkdir -p /home/frs/project/$SF_PROJECT/$TARGET_DIR"
-          # Upload parallel
-          cd ../upload
-          lftp -c "set sftp:auto-confirm yes; open -u $SF_USER,$SF_PASS sftp://frs.sourceforge.net; mirror -R . /home/frs/project/$SF_PROJECT/$TARGET_DIR/ --parallel=10 --include-glob '*.zip' --include-glob '*.img' --verbose"
-          echo "Upload selesai! Link: $SF_LINK"
-          echo "SF_LINK=$SF_LINK" >> $GITHUB_ENV  # Pass ke step berikutnya
+          # Test connection
+          lftp -u $SF_USER,$SF_PASS sftp://frs.sourceforge.net -e "ls; quit" || echo "Connection gagal! Cek creds."
+          # Buat folder (ignore error jika exist)
+          lftp -u $SF_USER,$SF_PASS sftp://frs.sourceforge.net -e "mkdir -p /home/frs/project/$SF_PROJECT/$TARGET_DIR; quit"
+          # Upload
+          cd upload
+          lftp -u $SF_USER,$SF_PASS sftp://frs.sourceforge.net -e "mirror -R . /home/frs/project/$SF_PROJECT/$TARGET_DIR/ --parallel=10 --include-glob '*.zip' --include-glob '*.img' --include-glob '*.7z' --verbose; quit"
+          echo "Upload selesai (jika ada files)! Link: $SF_LINK"
+          echo "SF_LINK=$SF_LINK" >> $GITHUB_ENV
 
       - name: Send Telegram Notification
         if: always()
@@ -77,8 +101,9 @@ jobs:
           message: |
             <b>OEM GSI Build: ${{ job.status == 'success' && '✅ Sukses' || '❌ Gagal' }}</b>
             <i>Repo:</i> <code>${{ github.repository }}</code>
-            <i>Trigger:</i> ${{ github.event_name }}
-            <i>Files di SourceForge:</i> <a href="${{ env.SF_LINK }}">Buka Folder</a>
-            <i>Waktu:</i> ${{ github.event.head_commit.timestamp || 'Manual' }}
-            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">📄 Lihat Logs</a>
-            <i>Catatan:</i> Cek output untuk detail files.
+            <i>URL Firmware:</i> <code>$URL</code>
+            <i>Type:</i> $FIRMWARE_TYPE ($OUTPUT_TYPE)
+            <i>Files di SourceForge:</i> <a href="${{ env.SF_LINK }}">Buka</a>
+            <i>Run ID:</i> ${{ github.run_id }}
+            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">📄 Logs</a>
+            <i>Debug:</i> Cek ls/find di logs untuk files.
