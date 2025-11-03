@@ -23,7 +23,7 @@ jobs:
 
       - name: Clone ErfanGSIs Tool
         run: |
-          git clone https://github.com/erfanoabap/ErfanGSIs.git
+          git clone https://github.com/erfanoabdi/ErfanGSIs.git
           cd ErfanGSIs
           git checkout master  # Atau branch stabil
 
